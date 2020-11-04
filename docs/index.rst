@@ -1,7 +1,4 @@
-.. pytube documentation master file, created by
-   sphinx-quickstart on Mon Oct  9 02:11:41 2017.
-   You can adapt this file completely to your liking, but it should at least
-   contain the root `toctree` directive.
+.. pytube documentation master file, created by sphinx-quickstart on Mon Oct  9 02:11:41 2017.
 
 pytube
 ======
@@ -14,10 +11,6 @@ Release v\ |version|. (:ref:`Installation <install>`)
 .. image:: https://travis-ci.org/nficano/pytube.svg?branch=master
    :alt: Build status
    :target: https://travis-ci.org/nficano/pytube
-
-.. image:: https://readthedocs.org/projects/python-pytube/badge/?version=latest
-  :target: http://python-pytube.readthedocs.io/en/latest/?badge=latest
-  :alt: Documentation Status
 
 .. image:: https://coveralls.io/repos/github/nficano/pytube/badge.svg?branch=master
   :alt: Coverage
@@ -33,6 +26,7 @@ Release v\ |version|. (:ref:`Installation <install>`)
 
 **Behold, a perfect balance of simplicity versus flexibility**::
 
+    >>> from pytube import YouTube
     >>> YouTube('https://youtu.be/9bZkp7q19f0').streams.first().download()
     >>> yt = YouTube('http://youtube.com/watch?v=9bZkp7q19f0')
     >>> yt.streams

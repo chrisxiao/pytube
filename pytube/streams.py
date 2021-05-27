@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 This module contains a container for stream manifest data.
 
@@ -10,16 +9,12 @@ separately).
 import logging
 import os
 from datetime import datetime
-from typing import BinaryIO
-from typing import Dict
-from typing import Optional
-from typing import Tuple
+from typing import BinaryIO, Dict, Optional, Tuple
+from urllib.error import HTTPError
 from urllib.parse import parse_qs
 
-from pytube import extract
-from pytube import request
-from pytube.helpers import safe_filename
-from pytube.helpers import target_directory
+from pytube import extract, request
+from pytube.helpers import safe_filename, target_directory
 from pytube.itags import get_format_profile
 from pytube.monostate import Monostate
 
@@ -74,7 +69,7 @@ class Stream:
         itag_profile = get_format_profile(self.itag)
         self.is_dash = itag_profile["is_dash"]
         self.abr = itag_profile["abr"]  # average bitrate (audio streams only)
-        self.fps = itag_profile[
+        self.fps = stream[
             "fps"
         ]  # frames per second (video streams only)
         self.resolution = itag_profile[
@@ -153,7 +148,12 @@ class Stream:
             Filesize (in bytes) of the stream.
         """
         if self._filesize is None:
-            self._filesize = request.filesize(self.url)
+            try:
+                self._filesize = request.filesize(self.url)
+            except HTTPError as e:
+                if e.code != 404:
+                    raise
+                self._filesize = request.seq_filesize(self.url)
         return self._filesize
 
     @property
@@ -205,6 +205,8 @@ class Stream:
         filename: Optional[str] = None,
         filename_prefix: Optional[str] = None,
         skip_existing: bool = True,
+        timeout: Optional[int] = None,
+        max_retries: Optional[int] = 0
     ) -> str:
         """Write the media stream to disk.
 
@@ -224,8 +226,14 @@ class Stream:
             filename but still add a prefix.
         :type filename_prefix: str or None
         :param skip_existing:
-            (optional) skip existing files, defaults to True
+            (optional) Skip existing files, defaults to True
         :type skip_existing: bool
+        :param timeout:
+            (optional) Request timeout length in seconds. Uses system default.
+        :type timeout: int
+        :param max_retries:
+            (optional) Number of retries to attempt after socket timeout. Defaults to 0.
+        :type max_retries: int
         :returns:
             Path to the saved video
         :rtype: str
@@ -238,23 +246,37 @@ class Stream:
         )
 
         if skip_existing and self.exists_at_path(file_path):
-            logger.debug("file %s already exists, skipping", file_path)
+            logger.debug(f'file {file_path} already exists, skipping')
             self.on_complete(file_path)
             return file_path
 
         bytes_remaining = self.filesize
-        logger.debug(
-            "downloading (%s total bytes) file to %s",
-            self.filesize,
-            file_path,
-        )
+        logger.debug(f'downloading ({self.filesize} total bytes) file to {file_path}')
 
         with open(file_path, "wb") as fh:
-            for chunk in request.stream(self.url):
-                # reduce the (bytes) remainder by the length of the chunk.
-                bytes_remaining -= len(chunk)
-                # send to the on_progress callback.
-                self.on_progress(chunk, fh, bytes_remaining)
+            try:
+                for chunk in request.stream(
+                    self.url,
+                    timeout=timeout,
+                    max_retries=max_retries
+                ):
+                    # reduce the (bytes) remainder by the length of the chunk.
+                    bytes_remaining -= len(chunk)
+                    # send to the on_progress callback.
+                    self.on_progress(chunk, fh, bytes_remaining)
+            except HTTPError as e:
+                if e.code != 404:
+                    raise
+                # Some adaptive streams need to be requested with sequence numbers
+                for chunk in request.seq_stream(
+                    self.url,
+                    timeout=timeout,
+                    max_retries=max_retries
+                ):
+                    # reduce the (bytes) remainder by the length of the chunk.
+                    bytes_remaining -= len(chunk)
+                    # send to the on_progress callback.
+                    self.on_progress(chunk, fh, bytes_remaining)
         self.on_complete(file_path)
         return file_path
 

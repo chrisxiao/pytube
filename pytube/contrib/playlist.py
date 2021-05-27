@@ -1,72 +1,78 @@
-# -*- coding: utf-8 -*-
 """Module to download a complete playlist from a youtube channel."""
 import json
 import logging
-import re
 from collections.abc import Sequence
-from datetime import date
-from datetime import datetime
-from typing import Dict, Tuple
-from typing import Iterable
-from typing import List
-from typing import Optional
-from typing import Union
-from urllib.parse import parse_qs
+from datetime import date, datetime
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
-from pytube import request
-from pytube import YouTube
-from pytube.helpers import cache
-from pytube.helpers import deprecated
-from pytube.helpers import install_proxy
-from pytube.helpers import uniqueify
+from pytube import extract, request, YouTube
+from pytube.helpers import cache, DeferredGeneratorList, install_proxy, uniqueify
 
 logger = logging.getLogger(__name__)
 
 
 class Playlist(Sequence):
-    """Load a YouTube playlist with URL or ID"""
+    """Load a YouTube playlist with URL"""
 
     def __init__(self, url: str, proxies: Optional[Dict[str, str]] = None):
         if proxies:
             install_proxy(proxies)
 
-        try:
-            self.playlist_id: str = parse_qs(url.split("?")[1])["list"][0]
-        except IndexError:  # assume that url is just the id
-            self.playlist_id = url
+        self._input_url = url
 
-        self.playlist_url = (
-            f"https://www.youtube.com/playlist?list={self.playlist_id}"
-        )
-        self.html = request.get(self.playlist_url)
+        # These need to be initialized as None for the properties.
+        self._html = None
+        self._ytcfg = None
+        self._initial_data = None
+        self._sidebar_info = None
 
-        # Needs testing with non-English
-        self.last_update: Optional[date] = None
-        date_match = re.search(
-            r"Last updated on (\w{3}) (\d{1,2}), (\d{4})", self.html
-        )
-        if date_match:
-            month, day, year = date_match.groups()
-            self.last_update = datetime.strptime(
-                f"{month} {day:0>2} {year}", "%b %d %Y"
-            ).date()
+        self._playlist_id = None
 
-        self._js_regex = re.compile(r"window\[\"ytInitialData\"] = ([^\n]+)")
+    @property
+    def playlist_id(self):
+        if self._playlist_id:
+            return self._playlist_id
+        self._playlist_id = extract.playlist_id(self._input_url)
+        return self._playlist_id
 
-        self._video_regex = re.compile(r"href=\"(/watch\?v=[\w-]*)")
+    @property
+    def playlist_url(self):
+        return f"https://www.youtube.com/playlist?list={self.playlist_id}"
 
-    @deprecated(
-        "This function will be removed in the future, please use .video_urls"
-    )
-    def parse_links(self) -> List[str]:  # pragma: no cover
-        """ Deprecated function for returning list of URLs
+    @property
+    def html(self):
+        if self._html:
+            return self._html
+        self._html = request.get(self.playlist_url)
+        return self._html
 
-        :return: List[str]
-        """
-        return self.video_urls
+    @property
+    def ytcfg(self):
+        if self._ytcfg:
+            return self._ytcfg
+        self._ytcfg = extract.get_ytcfg(self.html)
+        return self._ytcfg
 
-    def _extract_json(self, html: str) -> str:
-        return self._js_regex.search(html).group(1)[0:-1]
+    @property
+    def initial_data(self):
+        if self._initial_data:
+            return self._initial_data
+        else:
+            self._initial_data = extract.initial_data(self.html)
+            return self._initial_data
+
+    @property
+    def sidebar_info(self):
+        if self._sidebar_info:
+            return self._sidebar_info
+        else:
+            self._sidebar_info = self.initial_data['sidebar'][
+                'playlistSidebarRenderer']['items']
+            return self._sidebar_info
+
+    @property
+    def yt_api_key(self):
+        return self.ytcfg['INNERTUBE_API_KEY']
 
     def _paginate(
         self, until_watch_id: Optional[str] = None
@@ -80,11 +86,8 @@ class Playlist(Sequence):
         :rtype: Iterable[List[str]]
         :returns: Iterable of lists of YouTube watch ids
         """
-        req = self.html
         videos_urls, continuation = self._extract_videos(
-            # extract the json located inside the window["ytInitialData"] js
-            # variable of the playlist html page
-            self._extract_json(req)
+            json.dumps(extract.initial_data(self.html))
         )
         if until_watch_id:
             try:
@@ -100,15 +103,15 @@ class Playlist(Sequence):
         # than 100 songs inside a playlist, so we need to add further requests
         # to gather all of them
         if continuation:
-            load_more_url, headers = self._build_continuation_url(continuation)
+            load_more_url, headers, data = self._build_continuation_url(continuation)
         else:
-            load_more_url, headers = None, None
+            load_more_url, headers, data = None, None, None
 
-        while load_more_url and headers:  # there is an url found
+        while load_more_url and headers and data:  # there is an url found
             logger.debug("load more url: %s", load_more_url)
             # requesting the next page of videos with the url generated from the
-            # previous page
-            req = request.get(load_more_url, extra_headers=headers)
+            # previous page, needs to be a post
+            req = request.post(load_more_url, extra_headers=headers, data=data)
             # extract up to 100 songs from the page loaded
             # returns another continuation if more videos are available
             videos_urls, continuation = self._extract_videos(req)
@@ -122,32 +125,43 @@ class Playlist(Sequence):
             yield videos_urls
 
             if continuation:
-                load_more_url, headers = self._build_continuation_url(
+                load_more_url, headers, data = self._build_continuation_url(
                     continuation
                 )
             else:
-                load_more_url, headers = None, None
+                load_more_url, headers, data = None, None, None
 
-    @staticmethod
-    def _build_continuation_url(continuation: str) -> Tuple[str, dict]:
+    def _build_continuation_url(self, continuation: str) -> Tuple[str, dict, dict]:
         """Helper method to build the url and headers required to request
         the next page of videos
 
         :param str continuation: Continuation extracted from the json response
             of the last page
-        :rtype: Tuple[str, dict]
+        :rtype: Tuple[str, dict, dict]
         :returns: Tuple of an url and required headers for the next http
             request
         """
         return (
             (
-                f"https://www.youtube.com/browse_ajax?ctoken="
-                f"{continuation}&continuation={continuation}"
+                # was changed to this format (and post requests)
+                # between 2021.03.02 and 2021.03.03
+                "https://www.youtube.com/youtubei/v1/browse?key="
+                f"{self.yt_api_key}"
             ),
             {
                 "X-YouTube-Client-Name": "1",
                 "X-YouTube-Client-Version": "2.20200720.00.02",
             },
+            # extra data required for post request
+            {
+                "continuation": continuation,
+                "context": {
+                    "client": {
+                        "clientName": "WEB",
+                        "clientVersion": "2.20200720.00.02"
+                    }
+                }
+            }
         )
 
     @staticmethod
@@ -164,36 +178,38 @@ class Playlist(Sequence):
         try:
             # this is the json tree structure, if the json was extracted from
             # html
-            important_content = initial_data["contents"][
-                "twoColumnBrowseResultsRenderer"
-            ]["tabs"][0]["tabRenderer"]["content"]["sectionListRenderer"][
-                "contents"
-            ][
-                0
-            ][
-                "itemSectionRenderer"
-            ][
-                "contents"
-            ][
-                0
-            ][
-                "playlistVideoListRenderer"
-            ]
+            section_contents = initial_data["contents"][
+                "twoColumnBrowseResultsRenderer"][
+                "tabs"][0]["tabRenderer"]["content"][
+                "sectionListRenderer"]["contents"]
+            try:
+                # Playlist without submenus
+                important_content = section_contents[
+                    0]["itemSectionRenderer"][
+                    "contents"][0]["playlistVideoListRenderer"]
+            except (KeyError, IndexError, TypeError):
+                # Playlist with submenus
+                important_content = section_contents[
+                    1]["itemSectionRenderer"][
+                    "contents"][0]["playlistVideoListRenderer"]
+            videos = important_content["contents"]
         except (KeyError, IndexError, TypeError):
             try:
                 # this is the json tree structure, if the json was directly sent
                 # by the server in a continuation response
-                important_content = initial_data[1]["response"][
-                    "continuationContents"
-                ]["playlistVideoListContinuation"]
+                # no longer a list and no longer has the "response" key
+                important_content = initial_data['onResponseReceivedActions'][0][
+                    'appendContinuationItemsAction']['continuationItems']
+                videos = important_content
             except (KeyError, IndexError, TypeError) as p:
-                print(p)
+                logger.info(p)
                 return [], None
-        videos = important_content["contents"]
+
         try:
-            continuation = important_content["continuations"][0][
-                "nextContinuationData"
-            ]["continuation"]
+            continuation = videos[-1]['continuationItemRenderer'][
+                'continuationEndpoint'
+            ]['continuationCommand']['token']
+            videos = videos[:-1]
         except (KeyError, IndexError):
             # if there is an error, no continuation is available
             continuation = None
@@ -229,27 +245,37 @@ class Playlist(Sequence):
         for page in self._paginate(until_watch_id=video_id):
             yield from (self._video_url(watch_path) for watch_path in page)
 
+    def url_generator(self):
+        """Generator that yields video URLs.
+
+        :Yields: Video URLs
+        """
+        for page in self._paginate():
+            for video in page:
+                yield self._video_url(video)
+
     @property  # type: ignore
     @cache
-    def video_urls(self) -> List[str]:
+    def video_urls(self) -> DeferredGeneratorList:
         """Complete links of all the videos in playlist
 
         :rtype: List[str]
         :returns: List of video URLs
         """
-        return [
-            self._video_url(video)
-            for page in list(self._paginate())
-            for video in page
-        ]
+        return DeferredGeneratorList(self.url_generator())
+
+    def videos_generator(self):
+        for url in self.video_urls:
+            yield YouTube(url)
 
     @property
     def videos(self) -> Iterable[YouTube]:
         """Yields YouTube objects of videos in this playlist
 
-        :Yields: YouTube
+        :rtype: List[YouTube]
+        :returns: List of YouTube
         """
-        yield from (YouTube(url) for url in self.video_urls)
+        return DeferredGeneratorList(self.videos_generator())
 
     def __getitem__(self, i: Union[slice, int]) -> Union[str, List[str]]:
         return self.video_urls[i]
@@ -258,90 +284,27 @@ class Playlist(Sequence):
         return len(self.video_urls)
 
     def __repr__(self) -> str:
-        return f"{self.video_urls}"
+        return f"{repr(self.video_urls)}"
 
-    @deprecated(
-        "This call is unnecessary, you can directly access .video_urls or "
-        ".videos"
-    )
-    def populate_video_urls(self) -> List[str]:  # pragma: no cover
-        """Complete links of all the videos in playlist
+    @property
+    @cache
+    def last_updated(self) -> Optional[date]:
+        """Extract the date that the playlist was last updated.
 
-        :rtype: List[str]
-        :returns: List of video URLs
+        :return: Date of last playlist update
+        :rtype: datetime.date
         """
-        return self.video_urls
+        last_updated_text = self.sidebar_info[0]['playlistSidebarPrimaryInfoRenderer'][
+            'stats'][2]['runs'][1]['text']
+        date_components = last_updated_text.split()
+        month = date_components[0]
+        day = date_components[1].strip(',')
+        year = date_components[2]
+        return datetime.strptime(
+            f"{month} {day:0>2} {year}", "%b %d %Y"
+        ).date()
 
-    @deprecated("This function will be removed in the future.")
-    def _path_num_prefix_generator(self, reverse=False):  # pragma: no cover
-        """Generate number prefixes for the items in the playlist.
-
-        If the number of digits required to name a file,is less than is
-        required to name the last file,it prepends 0s.
-        So if you have a playlist of 100 videos it will number them like:
-        001, 002, 003 ect, up to 100.
-        It also adds a space after the number.
-        :return: prefix string generator : generator
-        """
-        digits = len(str(len(self.video_urls)))
-        if reverse:
-            start, stop, step = (len(self.video_urls), 0, -1)
-        else:
-            start, stop, step = (1, len(self.video_urls) + 1, 1)
-        return (str(i).zfill(digits) for i in range(start, stop, step))
-
-    @deprecated(
-        "This function will be removed in the future. Please iterate through "
-        ".videos"
-    )
-    def download_all(
-        self,
-        download_path: Optional[str] = None,
-        prefix_number: bool = True,
-        reverse_numbering: bool = False,
-        resolution: str = "720p",
-    ) -> None:  # pragma: no cover
-        """Download all the videos in the the playlist.
-
-        :param download_path:
-            (optional) Output path for the playlist If one is not
-            specified, defaults to the current working directory.
-            This is passed along to the Stream objects.
-        :type download_path: str or None
-        :param prefix_number:
-            (optional) Automatically numbers playlists using the
-            _path_num_prefix_generator function.
-        :type prefix_number: bool
-        :param reverse_numbering:
-            (optional) Lets you number playlists in reverse, since some
-            playlists are ordered newest -> oldest.
-        :type reverse_numbering: bool
-        :param resolution:
-            Video resolution i.e. "720p", "480p", "360p", "240p", "144p"
-        :type resolution: str
-        """
-        logger.debug("total videos found: %d", len(self.video_urls))
-        logger.debug("starting download")
-
-        prefix_gen = self._path_num_prefix_generator(reverse_numbering)
-
-        for link in self.video_urls:
-            youtube = YouTube(link)
-            dl_stream = (
-                youtube.streams.get_by_resolution(resolution=resolution)
-                or youtube.streams.get_lowest_resolution()
-            )
-            assert dl_stream is not None
-
-            logger.debug("download path: %s", download_path)
-            if prefix_number:
-                prefix = next(prefix_gen)
-                logger.debug("file prefix is: %s", prefix)
-                dl_stream.download(download_path, filename_prefix=prefix)
-            else:
-                dl_stream.download(download_path)
-            logger.debug("download complete")
-
+    @property
     @cache
     def title(self) -> Optional[str]:
         """Extract playlist title
@@ -349,13 +312,70 @@ class Playlist(Sequence):
         :return: playlist title (name)
         :rtype: Optional[str]
         """
-        pattern = re.compile("<title>(.+?)</title>")
-        match = pattern.search(self.html)
+        return self.sidebar_info[0]['playlistSidebarPrimaryInfoRenderer'][
+            'title']['runs'][0]['text']
 
-        if match is None:
-            return None
+    @property
+    def description(self) -> str:
+        return self.sidebar_info[0]['playlistSidebarPrimaryInfoRenderer'][
+            'description']['simpleText']
 
-        return match.group(1).replace("- YouTube", "").strip()
+    @property
+    def length(self):
+        """Extract the number of videos in the playlist.
+
+        :return: Playlist video count
+        :rtype: int
+        """
+        count_text = self.sidebar_info[0]['playlistSidebarPrimaryInfoRenderer'][
+            'stats'][0]['runs'][0]['text']
+        return int(count_text)
+
+    @property
+    def views(self):
+        """Extract view count for playlist.
+
+        :return: Playlist view count
+        :rtype: int
+        """
+        # "1,234,567 views"
+        views_text = self.sidebar_info[0]['playlistSidebarPrimaryInfoRenderer'][
+            'stats'][1]['simpleText']
+        # "1,234,567"
+        count_text = views_text.split()[0]
+        # "1234567"
+        count_text = count_text.replace(',', '')
+        return int(count_text)
+
+    @property
+    def owner(self):
+        """Extract the owner of the playlist.
+
+        :return: Playlist owner name.
+        :rtype: str
+        """
+        return self.sidebar_info[1]['playlistSidebarSecondaryInfoRenderer'][
+            'videoOwner']['videoOwnerRenderer']['title']['runs'][0]['text']
+
+    @property
+    def owner_id(self):
+        """Extract the channel_id of the owner of the playlist.
+
+        :return: Playlist owner's channel ID.
+        :rtype: str
+        """
+        return self.sidebar_info[1]['playlistSidebarSecondaryInfoRenderer'][
+            'videoOwner']['videoOwnerRenderer']['title']['runs'][0][
+            'navigationEndpoint']['browseEndpoint']['browseId']
+
+    @property
+    def owner_url(self):
+        """Create the channel url of the owner of the playlist.
+
+        :return: Playlist owner's channel url.
+        :rtype: str
+        """
+        return f'https://www.youtube.com/channel/{self.owner_id}'
 
     @staticmethod
     def _video_url(watch_path: str):

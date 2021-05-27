@@ -4,11 +4,11 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-typing_extensions = "*"
 
 [dev-packages]
+bumpversion = "*"
+twine = "*"
 black = "==19.10b0"
-codecov = "*"
 coveralls = "*"
 coverage = "*"
 flake8 = "*"

@@ -1,5 +1,5 @@
-# -*- coding: utf-8 -*-
 """Unit tests for the :module:`extract <extract>` module."""
+from datetime import datetime
 import pytest
 
 from pytube import extract
@@ -17,8 +17,8 @@ def test_info_url(age_restricted):
         video_id="QRS8MkLhQmM", embed_html=age_restricted["embed_html"],
     )
     expected = (
-        "https://youtube.com/get_video_info?video_id=QRS8MkLhQmM&eurl"
-        "=https%3A%2F%2Fyoutube.googleapis.com%2Fv%2FQRS8MkLhQmM&sts="
+        "https://www.youtube.com/get_video_info?video_id=QRS8MkLhQmM&eurl"
+        "=https%3A%2F%2Fyoutube.googleapis.com%2Fv%2FQRS8MkLhQmM&sts=&html5=1"
     )
     assert video_info_url == expected
 
@@ -29,9 +29,9 @@ def test_info_url_age_restricted(cipher_signature):
         watch_url=cipher_signature.watch_url,
     )
     expected = (
-        "https://youtube.com/get_video_info?video_id=2lAe1cqCOXo"
+        "https://www.youtube.com/get_video_info?video_id=2lAe1cqCOXo"
         "&ps=default&eurl=https%253A%2F%2Fyoutube.com%2Fwatch%253Fv%"
-        "253D2lAe1cqCOXo&hl=en_US"
+        "253D2lAe1cqCOXo&hl=en_US&html5=1"
     )
     assert video_info_url == expected
 
@@ -50,6 +50,28 @@ def test_age_restricted(age_restricted):
 
 def test_non_age_restricted(cipher_signature):
     assert not extract.is_age_restricted(cipher_signature.watch_html)
+
+
+def test_is_private(private):
+    assert extract.is_private(private['watch_html'])
+
+
+def test_not_is_private(cipher_signature):
+    assert not extract.is_private(cipher_signature.watch_html)
+
+
+def test_recording_available(cipher_signature):
+    assert extract.recording_available(cipher_signature.watch_html)
+
+
+def test_publish_date(cipher_signature):
+    expected = datetime(2019, 12, 5)
+    assert cipher_signature.publish_date == expected
+    assert extract.publish_date('') is None
+
+
+def test_not_recording_available(missing_recording):
+    assert not extract.recording_available(missing_recording['watch_html'])
 
 
 def test_mime_type_codec():
@@ -79,3 +101,13 @@ def test_signature_cipher_does_not_error(stream_dict):
     config_args = extract.get_ytplayer_config(stream_dict)['args']
     extract.apply_descrambler(config_args, "url_encoded_fmt_stream_map")
     assert "s" in config_args["url_encoded_fmt_stream_map"][0].keys()
+
+
+def test_initial_data_missing():
+    with pytest.raises(RegexMatchError):
+        extract.initial_data('')
+
+
+def test_initial_data(stream_dict):
+    initial_data = extract.initial_data(stream_dict)
+    assert 'contents' in initial_data

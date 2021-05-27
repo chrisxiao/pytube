@@ -1,12 +1,12 @@
-# -*- coding: utf-8 -*-
 import os
 import random
+import pytest
 from datetime import datetime
 from unittest import mock
 from unittest.mock import MagicMock, Mock
+from urllib.error import HTTPError
 
-from pytube import request
-from pytube import Stream
+from pytube import request, Stream
 
 
 @mock.patch("pytube.streams.request")
@@ -52,8 +52,7 @@ def test_default_filename(cipher_signature):
 
 
 def test_title(cipher_signature):
-    expected = "title"
-    cipher_signature.player_response = {"videoDetails": {"title": expected}}
+    expected = "YouTube Rewind 2019: For the Record | #YouTubeRewind"
     assert cipher_signature.title == expected
 
 
@@ -250,17 +249,18 @@ def test_on_complete_hook(cipher_signature):
 
 def test_author(cipher_signature):
     expected = "Test author"
-    cipher_signature.player_response = {"videoDetails": {"author": expected}}
+    cipher_signature._player_response = {"videoDetails": {"author": expected}}
     assert cipher_signature.author == expected
 
     expected = "unknown"
-    cipher_signature.player_response = {}
+    cipher_signature.author = None
+    cipher_signature._player_response = {'key': 'value'}
     assert cipher_signature.author == expected
 
 
 def test_thumbnail_when_in_details(cipher_signature):
     expected = "some url"
-    cipher_signature.player_response = {
+    cipher_signature._player_response = {
         "videoDetails": {"thumbnail": {"thumbnails": [{"url": expected}]}}
     }
     assert cipher_signature.thumbnail_url == expected
@@ -268,7 +268,7 @@ def test_thumbnail_when_in_details(cipher_signature):
 
 def test_thumbnail_when_not_in_details(cipher_signature):
     expected = "https://img.youtube.com/vi/2lAe1cqCOXo/maxresdefault.jpg"
-    cipher_signature.player_response = {}
+    cipher_signature._player_response = {'key': 'value'}
     assert cipher_signature.thumbnail_url == expected
 
 
@@ -284,7 +284,7 @@ def test_repr_for_audio_streams(cipher_signature):
 def test_repr_for_video_streams(cipher_signature):
     stream = str(cipher_signature.streams.filter(only_video=True)[0])
     expected = (
-        '<Stream: itag="137" mime_type="video/mp4" res="1080p" fps="30fps" '
+        '<Stream: itag="137" mime_type="video/mp4" res="1080p" fps="24fps" '
         'vcodec="avc1.640028" progressive="False" type="video">'
     )
     assert stream == expected
@@ -293,7 +293,7 @@ def test_repr_for_video_streams(cipher_signature):
 def test_repr_for_progressive_streams(cipher_signature):
     stream = str(cipher_signature.streams.filter(progressive=True)[0])
     expected = (
-        '<Stream: itag="18" mime_type="video/mp4" res="360p" fps="30fps" '
+        '<Stream: itag="18" mime_type="video/mp4" res="360p" fps="24fps" '
         'vcodec="avc1.42001E" acodec="mp4a.40.2" progressive="True" '
         'type="video">'
     )
@@ -303,7 +303,88 @@ def test_repr_for_progressive_streams(cipher_signature):
 def test_repr_for_adaptive_streams(cipher_signature):
     stream = str(cipher_signature.streams.filter(adaptive=True)[0])
     expected = (
-        '<Stream: itag="137" mime_type="video/mp4" res="1080p" fps="30fps" '
+        '<Stream: itag="137" mime_type="video/mp4" res="1080p" fps="24fps" '
         'vcodec="avc1.640028" progressive="False" type="video">'
     )
     assert stream == expected
+
+
+def test_segmented_stream_on_404(cipher_signature):
+    stream = cipher_signature.streams.filter(adaptive=True)[0]
+    with mock.patch('pytube.request.head') as mock_head:
+        with mock.patch('pytube.request.urlopen') as mock_url_open:
+            # Mock the responses to YouTube
+            mock_url_open_object = mock.Mock()
+
+            # These are our 4 "segments" of a dash stream
+            # The first explains how many pieces there are, and
+            # the rest are those pieces
+            responses = [
+                b'Raw_data\r\nSegment-Count: 3',
+                b'a',
+                b'b',
+                b'c',
+            ]
+            joined_responses = b''.join(responses)
+
+            # We create response headers to match the segments
+            response_headers = [
+                {
+                    'content-length': len(r),
+                    'Content-Range': '0-%s/%s' % (str(len(r)), str(len(r)))
+                }
+                for r in responses
+            ]
+
+            # Request order for stream:
+            # Filesize:
+            #   1. head(url) -> 404
+            #   2. get(url&sn=0)
+            #   3. head(url&sn=[1,2,3])
+            # Download:
+            #   4. info(url) -> 404
+            #   5. get(url&sn=0)
+            #   6. get(url&sn=[1,2,3])
+
+            # Handle filesize requests
+            mock_head.side_effect = [
+                HTTPError('', 404, 'Not Found', '', ''),
+                *response_headers[1:],
+            ]
+
+            # Each response must be followed by None, to break iteration
+            #  in the stream() function
+            mock_url_open_object.read.side_effect = [
+                responses[0], None,
+                responses[0], None,
+                responses[1], None,
+                responses[2], None,
+                responses[3], None,
+            ]
+
+            # This handles the HEAD requests to get content-length
+            mock_url_open_object.info.side_effect = [
+                HTTPError('', 404, 'Not Found', '', ''),
+                *response_headers
+            ]
+
+            mock_url_open.return_value = mock_url_open_object
+
+            with mock.patch('builtins.open', new_callable=mock.mock_open) as mock_open:
+                file_handle = mock_open.return_value.__enter__.return_value
+                fp = stream.download()
+                full_content = b''
+                for call in file_handle.write.call_args_list:
+                    args, kwargs = call
+                    full_content += b''.join(args)
+
+                assert full_content == joined_responses
+                mock_open.assert_called_once_with(fp, 'wb')
+
+
+def test_segmented_only_catches_404(cipher_signature):
+    stream = cipher_signature.streams.filter(adaptive=True)[0]
+    with mock.patch('pytube.request.head') as mock_head:
+        mock_head.side_effect = HTTPError('', 403, 'Forbidden', '', '')
+        with pytest.raises(HTTPError):
+            stream.download()
